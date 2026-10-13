@@ -1,573 +1,68 @@
 # maudebox
 
-A Docker image for working on Maven projects (and adjacent polyglot bits) with [Claude Code](https://claude.ai/code) in an isolated, reproducible Linux environment. Bundles:
-
-- Eclipse Temurin JDK 26
-- [`mvnd`](https://github.com/apache/maven-mvnd) (Maven Daemon) — symlinked as both `mvnd` and `mvn`
-- A Rust toolchain (rustup-managed, default 1.98.0) plus `build-essential` for crates with native dependencies
-- Python 3 with `pip`, `venv`, and development headers (`python` is symlinked to `python3`)
-- [`bun`](https://bun.sh) and [`pnpm`](https://pnpm.io) for JavaScript/TypeScript work (pnpm bundles its own Node.js; bun is its own runtime)
-- [Playwright](https://playwright.dev) — the `playwright` CLI with Chromium and its OS dependencies preinstalled, plus the [`@playwright/mcp`](https://github.com/microsoft/playwright-mcp) server (`playwright-mcp`) so Claude can drive a browser. Both run under `bun` (no Node.js needed); browsers live in a shared system path, so add an `[mcp.playwright]` table pointing at `playwright-mcp` to wire it into Claude Code
-- `git` and [`jj`](https://github.com/jj-vcs/jj) (Jujutsu VCS)
-- Claude Code CLI
-- [Codex CLI](https://github.com/openai/codex) — OpenAI's coding agent, native binary
-- [opencode](https://opencode.ai) — open-source coding agent, native binary
-- GitHub CLI (`gh`)
-- `ripgrep`, `jq`, `vim`, `less`, `sudo`, `rsync`, OpenSSH client (`ssh`, `ssh-keygen`, `scp`)
-- `perf` (Linux profiler) — the container receives only the narrow `CAP_PERFMON` profiling capability; userspace profiling works as the regular user, while profiling beyond the host's `perf_event_paranoid` policy needs `sudo perf …`
-- `fusermount3` (from `fuse3`) — the mount helper every FUSE client needs; mounting requires launching with `--fuse` (see [FUSE filesystems](#fuse-filesystems)), and the client itself (`sshfs`, `rclone`, `gocryptfs`, …) is a `sudo apt-get install …` away inside the container
-
-Builds natively on amd64 and arm64.
-
-The product behavior and deliberate scope boundaries are specified in
-[`docs/SPEC.md`](docs/SPEC.md). Architectural decisions and their trade-offs
-are recorded in [`docs/decisions/`](docs/decisions/).
-
-## What problems does this solve
-
-### Sandboxed Claude Code execution
-
-Running Claude Code directly on your host gives it the same access you have: your entire home directory, your SSH keys, your shell history, every other project on disk, and the ability to run anything `$PATH` exposes. That's a lot of blast radius for an agent that may execute commands you didn't read carefully.
-
-`maudebox` runs Claude inside a container that can only see **the project directory you point it at** (and, for jj workspaces and git worktrees, the base repo it depends on), the explicitly configured mounts, and the host's Maven artifact cache at `~/.m2/repository`. Everything else — `~/.ssh`, `~/.aws`, sibling projects, your shell config, your browser profile — is not mounted and is not reachable. The container has no host network privileges beyond what Docker grants, no access to your host's package managers, and no way to install daemons on your machine. Claude can run `mvnd verify`, edit files in the project, run tests, and `jj` / `git` commands against that worktree, but it cannot wander out of those exposed paths.
-
-Auth material is held back deliberately: `~/.ssh`, `~/.git-credentials`, and `~/.gnupg` are **not** mounted, and `commit.gpgsign` / `tag.gpgSign` are forced off inside the container so a host signing config (e.g. 1Password's macOS-only ssh-sign) doesn't either auto-fail every commit or — worse — get exercised against keys the container shouldn't be able to use. The container does get its own separate `~/.ssh`, persisted across maudebox instances but starting empty and never populated from the host — see [Login state and global config](#login-state-and-global-config).
-
-### No-conflict snapshot publishing across worktrees
-
-Maven's local repository (`~/.m2/repository`) is a shared mutable store. When two builds running concurrently both `mvn install` a snapshot under the same coordinates, the last writer wins and the other build silently picks up the wrong artifact. With multiple Claude sessions iterating on different feature branches in different worktrees of the same project, this is a near-constant footgun: session A installs `1.2.3-SNAPSHOT` from its branch, session B's compile then resolves A's jars, and B's "test failure" has nothing to do with B's code.
-
-`maudebox` configures Maven Resolver's split local-repository layout automatically. The host's `~/.m2/repository` is mounted read-write at the container's `repository/remote-cache/` prefix, so third-party downloads populate one warm cache shared with host Maven without changing the host layout. Resolver routes artifacts produced by `mvn install` into `repository/local-installs/` in the container's writable layer. Two concurrent maudebox containers therefore see their own `1.2.3-SNAPSHOT` installs without duplicating the persistent remote cache or requiring overlayfs; those local installs disappear when each container exits.
-
-The shared cache is intentionally RW: a process in the container can modify or delete third-party artifacts in the host repository. The split layout prevents normal Maven installs from landing there; it is not a security boundary against a malicious process that writes to the mounted path directly. Maven settings and credentials elsewhere under `~/.m2` are not mounted.
-
-### Shared logins and global config
-
-As a convenience, the host's global Claude config (`CLAUDE.md`, `settings.json`, `agents/`, `commands/`, `skills/`, `plugins/`), Codex config (`~/.codex/AGENTS.md`, `~/.agents/skills/`) and opencode config (`~/.config/opencode/`'s `AGENTS.md`, `agent/`, `command/`, `skill/`, …) are bind-mounted read-only. Login state for Claude, Codex, opencode, and the GitHub CLI — plus any SSH keys you generate inside a container — is kept in a selected persistent state namespace. Log in once to each inside a namespace (`claude`, `codex login`, `opencode auth login`, `gh auth login`); future launches using it are already logged in. Those logins stay inside the containers: no agent's credential store is mounted from the host.
-
-## Prerequisites
-
-- Docker (tested with OrbStack on macOS; should work with Docker Desktop and native Linux Docker too).
-- A Rust toolchain (stable, 1.85+) to build the wrapper. `cargo` and `rustc` only.
-- A host directory where maudebox can create `~/.m2/repository` if it does not already exist.
-- A host with Claude Code installed (optional — its global config under `~/.claude/` is bind-mounted into the container if present).
-
-## Build
-
-The repo is a Cargo workspace. One tool builds both the host-side wrapper and the docker image:
+A Docker image and host-side wrapper for running coding agents — [Claude Code](https://claude.ai/code), [Codex](https://github.com/openai/codex) and [opencode](https://opencode.ai) — against a project in an isolated, reproducible Linux environment, with Maven, Rust and JavaScript toolchains ready to go.
 
 ```sh
-cargo build --release        # wrapper binary at target/release/maudebox
-cargo xtask image            # docker image (defaults: mvnd 1.0.6, jj 0.44.0, tag maudebox)
-cargo xtask all              # both, in one go
+maudebox . claude      # Claude Code, sandboxed to this project
+maudebox . mvnd verify # one-shot Maven build
+maudebox new feature-x # fresh jj workspace / git worktree, in its own container
 ```
 
-Downloaded mvnd, jj, rustup, bun, pnpm, and opencode artifacts are checked against their publishers' SHA-256/SHA-512 metadata before extraction. The Claude installer is downloaded over TLS to a file before execution; its upstream distribution currently does not publish a separate checksum through this build interface.
+## What's in the image
 
-Version pins and tag can be overridden:
+| Area | Contents |
+| --- | --- |
+| Java | Eclipse Temurin JDK 26; [`mvnd`](https://github.com/apache/maven-mvnd) (also installed as `mvn`) |
+| Rust | rustup-managed toolchain (default 1.98.0) and `build-essential` |
+| Python | Python 3 with `pip`, `venv` and headers (`python` → `python3`) |
+| JavaScript | [`bun`](https://bun.sh) and [`pnpm`](https://pnpm.io) (pnpm bundles its own Node.js) |
+| Browser | [Playwright](https://playwright.dev) CLI with Chromium, plus the [`@playwright/mcp`](https://github.com/microsoft/playwright-mcp) server (`playwright-mcp`), both run under `bun` |
+| VCS | `git`, [`jj`](https://github.com/jj-vcs/jj), GitHub CLI (`gh`) |
+| Agents | Claude Code, Codex CLI, opencode |
+| Utilities | `ripgrep`, `jq`, `vim`, `less`, `sudo`, `rsync`, OpenSSH client |
+| Profiling | `perf` (container gets only `CAP_PERFMON`; profiling beyond the host's `perf_event_paranoid` needs `sudo perf`) |
+| FUSE | `fusermount3`; mounting needs `--fuse` ([details](docs/guides/configuration.md#fuse-filesystems)) |
+
+Pinned versions live in `xtask/src/main.rs`. The image builds natively on amd64 and arm64.
+
+## Why
+
+- **Sandboxed agents.** The container sees only the project directory (plus the base repo of a jj workspace or git worktree), explicitly configured mounts, and the host's Maven cache. `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.git-credentials`, sibling projects and your shell config are never mounted, and commit signing is forced off so a host signing setup can't fail or be misused. The container has its own `~/.ssh`, persisted but never populated from the host.
+- **Conflict-free snapshot installs.** Maven Resolver's split local repository sends third-party downloads to a warm cache shared with the host and `mvn install` output to the container's own layer, so concurrent worktrees never see each other's `-SNAPSHOT` jars. The shared cache is mounted read-write on purpose; this is not a security boundary against a hostile process. See [Maven repository](docs/guides/internals.md#maven-repository).
+- **Log in once.** Claude, Codex, opencode, `gh` and SSH state live in a persistent *state namespace*, and your hand-written global agent config is mounted read-only. Agent credentials are never taken from the host. See [Agents and state](docs/guides/agents.md).
+
+## Quick start
+
+Prerequisites: Docker 25+ (tested with OrbStack on macOS; Docker Desktop and native Linux also work) and a Rust toolchain (1.85+) to build the wrapper.
 
 ```sh
-cargo xtask image --mvnd-version 1.0.6 --jj-version 0.44.0 --rust-version 1.98.0 --bun-version 1.4.0 --pnpm-version 11.22.0 --claude-version 2.1.228 --codex-version 0.154.0 --opencode-version 1.18.21 --playwright-version 1.62.1 --playwright-mcp-version 0.0.79 --tag maudebox
+cargo build --release   # wrapper at target/release/maudebox
+cargo xtask image       # docker image, tag "maudebox"
+cargo xtask all         # both
 ```
 
-## Run
-
-Install the wrapper somewhere on your `$PATH` — either via `cargo install --path .` (drops it under `~/.cargo/bin/`) or by symlinking the release build (`ln -s "$PWD/target/release/maudebox" ~/.local/bin/maudebox`). The examples below assume it's on `$PATH`.
+Put the wrapper on your `$PATH` (`cargo install --path .`, or symlink `target/release/maudebox`), then:
 
 ```sh
 maudebox                          # interactive shell, current directory
 maudebox /path/to/project         # interactive shell, specific project
-maudebox . mvnd verify            # one-shot Maven build
 maudebox . claude                 # launch Claude Code
-maudebox --state work . claude    # use an independent login/session namespace
-maudebox rm /path/to/project      # tear down an instance (workspace if maudebox created it, plus volumes + state dir)
-maudebox --tag my-tag . bash      # use a non-default image tag
-maudebox list                     # list registered maudebox instances
-maudebox state list               # list persistent state namespaces
-maudebox keep feature-x           # don't tear down on exit (running ephemeral)
+maudebox --state work . claude    # independent login/session namespace
+maudebox list                     # projects and their running instances
+maudebox rm /path/to/project      # remove a project's volumes and state
 ```
 
-Run `maudebox --help` for the full option list.
-
-The host project directory is bind-mounted into the container at its **original host path** (e.g. `/Users/martin/projects/trino/workspaces/trino.lateral`). The entrypoint also creates a `/root/<basename>` symlink to that path and starts the shell there, so `$PWD` shows a short, friendly path while the underlying filesystem is still the host-path bind-mount.
-
-The same basename is also exposed as `$MAUDEBOX_INSTANCE` inside the container and used as the **docker container name** — so `docker ps` lists it directly and `docker exec trino bash` works without copy-pasting a container ID. Aliases like `claude --remote-control "$MAUDEBOX_INSTANCE"` use the same handle.
-
-#### Two concurrent containers on the same repo
-
-If you want a second session on the same project — typical case: one for coding, one for review — pass `--instance NAME` to discriminate it:
-
-```sh
-maudebox . claude                         # MAUDEBOX_INSTANCE=trino
-maudebox --instance review . claude       # MAUDEBOX_INSTANCE=trino-review
-```
-
-The flag is appended to the project basename, not a full override, so the basename stays a stable prefix. The discriminator also threads into the docker container name and the `maudebox.instance` label, so the two sessions appear as distinct handles to `claude --remote-control` and other tools that key off `$MAUDEBOX_INSTANCE`. Overlay volumes and the per-instance state dir are still keyed only on the project path, so both sessions share Maven cache state — if that's not what you want, use `maudebox new` to spin up a second worktree instead.
-
-The container hostname also matches `$MAUDEBOX_INSTANCE`. Codex's managed app-server runtime directory (`~/.codex/app-server-control`) is a tmpfs, private to the container and gone when it exits — it holds only a startup lock and a Unix socket. Consequently, `codex remote-control start; codex --remote unix://` starts or attaches to that container's own daemon instead of reusing a daemon from another maudebox. Codex auth, configuration, skills, and history outside that runtime directory are shared by launches using the same state namespace.
-
-If the project is a **jj workspace** or **git worktree**, `maudebox` reads its metadata (`.jj/repo` for jj, `.git` for git), finds the base repo, and bind-mounts it at its host path too — so the absolute paths recorded inside the worktree resolve correctly and `jj` / `git` commands Just Work.
-
-#### Referring to projects by name
-
-`maudebox <name>` and `maudebox new --source <name>` accept a bare name in place of a path. The name is resolved in two steps:
-
-1. **Workspaces created by `maudebox new`** — matched by the name passed to `new`, so a workspace can be re-entered without retyping its path (see [Reattaching to a non-ephemeral workspace](#reattaching-to-a-non-ephemeral-workspace)).
-2. **`project-roots`** — directories listed in the user config; the first `<root>/<name>` that exists on disk is used.
-
-```toml
-project-roots = [
-    "~/Projects",
-    "~/work",
-]
-```
-
-With `~/Projects/trino` on disk and `~/Projects` configured as a root, `maudebox trino` launches a container for it without typing the path. A name that resolves under more than one root — or matches more than one `new` workspace — is reported as ambiguous rather than guessed. Anything containing a `/`, or starting with `/`, `.`, or `~`, is always treated as a literal path and skips name resolution.
-
-### Extra bind mounts
-
-By default `maudebox` sets up the project tree, the Maven repository mounts, and the selected state namespace. Any other host path you want exposed inside the container — `~/.aws`, a notes directory, another shared cache — is declared explicitly.
-
-Two equivalent ways:
-
-- **Command line:** `--mount HOST:CONTAINER[:ro|rw|overlay]`, repeatable.
-
-  ```sh
-  maudebox --mount ~/.aws:~/.aws:ro --mount ~/Documents/notes:~/notes
-  ```
-
-- **`$XDG_CONFIG_HOME/maudebox/config.toml`** (TOML; defaults to `~/.config/maudebox/config.toml`) — applies to every invocation:
-
-  ```toml
-  mounts = [
-      "~/.aws:~/.aws:ro",
-      "~/Documents/notes:~/notes",
-      "~/.gradle:~/.gradle:overlay",
-  ]
-  ```
-
-In both cases the spec syntax is `HOST:CONTAINER[:ro|rw|overlay]`. A leading `~` on the host side expands to `$HOME` (your host home); on the container side it expands to `/root` (the container's home, fixed by the entrypoint). Mode defaults to `rw`. CLI mounts are forwarded to the inner instance when used with `maudebox new`.
-
-Configuration is type-checked when it is read. Keys such as `mounts`, `project-roots`, and `default-command` must be arrays of strings; `network` must be a string or an array of strings; `state` must be a string; `fuse` must be a boolean; alias values must be strings. Invalid values stop the launch with the key and array index instead of being silently ignored.
-
-**Overlay mode** layers a per-worktree writable Docker volume over the read-only host source, giving each worktree isolated writes while sharing the host content as warm starting state — handy for caches such as `~/.cargo`, `~/.gradle`, and `~/.npm`. Maven no longer needs an overlay: its split repository is built in. An existing `~/.m2:~/.m2:overlay` configuration conflicts with the built-in mounts and must be removed.
-
-```sh
-maudebox mount rm ~/.m2:~/.m2:overlay
-```
-
-#### Managing mounts from the CLI
-
-You can edit `the user config` by hand, but a small subcommand handles the common operations:
-
-```sh
-maudebox mount add ~/.gradle:~/.gradle:overlay # append to the user config
-maudebox mount list                        # print configured specs
-maudebox mount rm  ~/.gradle:~/.gradle:overlay # remove an exact-match spec
-```
-
-`add` is idempotent (a duplicate spec is left as-is). `rm` requires an exact match against what `mount list` shows — copy-paste from `list` rather than retyping. Only the `mounts = [ ... ]` block in `the user config` is rewritten on mutation; comments and any other TOML content elsewhere in the file are preserved verbatim.
-
-### Aliases
-
-Define bash aliases that get installed automatically inside the container at shell startup. Stored in the `[aliases]` table of `the user config`:
-
-```toml
-[aliases]
-cl = "claude --dangerously-skip-permissions --remote-control $MAUDEBOX_INSTANCE"
-build = "mvnd verify"
-```
-
-Manage from the CLI:
-
-```sh
-maudebox alias add cl 'claude --dangerously-skip-permissions --remote-control $MAUDEBOX_INSTANCE'
-maudebox alias list
-maudebox alias rm cl
-```
-
-Single-quote VALUE on the host so `$MAUDEBOX_INSTANCE` (and any other `$VAR` references) stay literal in the alias definition — they expand each time the alias is invoked, picking up the actual container env. `add` updates the value if the name already exists; `rm` removes by name. Only the `[aliases]` table is rewritten on mutation; the rest of `the user config` is preserved.
-
-### Default command
-
-Running `maudebox` or `maudebox new` with no command opens an interactive shell. To launch something else by default — typically Claude Code — set `default-command` in the user config:
-
-```toml
-default-command = ["claude"]
-```
-
-It's an array, so a command with arguments needs no shell quoting:
-
-```toml
-default-command = ["claude", "--dangerously-skip-permissions"]
-```
-
-An explicit command on the CLI always takes precedence, so `maudebox . bash` still drops you in a shell. The default applies wherever a command is otherwise absent — plain `maudebox`, `maudebox <name>`, and `maudebox new <name>`.
-
-### Editing the user config directly
-
-For anything the `mount` / `alias` subcommands don't cover (e.g. `[mcp.*]` or `[codex]` tables), open the file in your editor:
-
-```sh
-maudebox config edit    # opens $VISUAL / $EDITOR (or vi) on the config file
-maudebox config path    # prints the path, e.g. for piping to other tools
-```
-
-`config edit` honors `$VISUAL` first, then `$EDITOR`, and finally falls back to `vi`. The command runs through `sh -c` so editor values that embed flags (e.g. `EDITOR="code --wait"`) work as-is. The parent directory (`$XDG_CONFIG_HOME/maudebox/`) is created if it doesn't already exist; the file itself is left to the editor to create on save.
-
-Aliases also work when invoked non-interactively via `maudebox <path> <name> <args>`. Bash's built-in alias mechanism only fires for interactive shells, so the wrapper detects an alias name as the first user argument and rewrites the docker run command to `bash -c '<value> "$@"' <name> <args>` — same expansion semantics as the interactive case, with trailing args forwarded through `$@`.
-
-### Reaching host services
-
-The container can reach services running on the host (e.g. an HTTP MCP server, a local dev API) at `host.docker.internal`. `maudebox` passes `--add-host=host.docker.internal:host-gateway` to `docker run` so this resolves on Linux as well as macOS/OrbStack. From inside the container, point at `http://host.docker.internal:<port>`; `localhost` still means the container itself.
-
-For an HTTP MCP server in particular, either drop a `.mcp.json` at the project root with the URL (it's bind-mounted in and Claude picks it up automatically), or run `claude mcp add --transport http <name> http://host.docker.internal:<port>` once — that persists in the selected state namespace and is available to future launches using it.
-
-### Reaching a service in another container (e.g. docker-compose)
-
-`host.docker.internal` only reaches services **published to the host**. If a service runs in its own container — typically brought up by its own `docker compose` project — and you'd rather not publish its port to the host at all (so it stays off the machine's public interface), join its Docker network directly instead:
-
-```sh
-maudebox --network myservice_default . claude
-```
-
-Compose creates a network named `<compose-project>_default` (the project name defaults to the compose directory's basename; check `docker network ls`). On that network the service is reachable by its **compose service name** and **container port** — e.g. `http://app:8080` — with nothing published to the host. `host.docker.internal` still resolves, so host-published services remain reachable too.
-
-`--network` is repeatable, so the container can join several networks at once — handy when a service and its database live in separate compose stacks:
-
-```sh
-maudebox --network app_default --network db_default . claude
-```
-
-Set it once in `the user config` to apply to every invocation — a bare string for one network, or an array for several:
-
-```toml
-network = "myservice_default"            # single
-network = ["app_default", "db_default"]  # several
-```
-
-Any `--network` flag overrides the config key entirely (the two don't merge). The named networks must already exist — bring the relevant compose projects up first.
-
-### FUSE filesystems
-
-Mounting a FUSE filesystem from inside the container — `sshfs` onto a remote box, `rclone mount` for cloud storage, `gocryptfs` for an encrypted tree — is off by default and enabled per launch with `--fuse`:
-
-```sh
-maudebox --fuse . bash
-```
-
-or for every launch, via the user config:
-
-```toml
-fuse = true
-```
-
-The flag exposes the host's `/dev/fuse` to the container and adds the `SYS_ADMIN` capability plus `--security-opt apparmor=unconfined` — the same privileges an `overlay` mount already requires, and the reason this isn't on by default. The kernel needs them for the `mount(2)` call itself: `fusermount3` is setuid root, but a setuid binary only gains a capability that's in the container's bounding set, and Docker's default seccomp and AppArmor profiles both block mounting without it.
-
-The image ships `fuse3` (the `fusermount3` helper and `user_allow_other` in `/etc/fuse.conf`) but no clients, so install the one you need inside the container:
-
-```sh
-sudo apt-get update && sudo apt-get install -y sshfs
-mkdir -p ~/remote && sshfs user@host:/srv ~/remote
-```
-
-Two caveats: the mount lives and dies with the container (it's inside the container's mount namespace, invisible to the host), and `--fuse` fails at `docker run` time if the host itself has no `/dev/fuse` — load the host's `fuse` module first.
-
-### Managed MCP servers
-
-If you want one or more MCP servers available in **every** maudebox container with no per-container `claude mcp add`, declare them in the user config as `[mcp.NAME]` tables:
-
-```toml
-[mcp.my_http]
-type = "http"
-url = "http://host.docker.internal:8080/mcp"
-
-[mcp.my_stdio]
-type = "stdio"
-command = "python"
-args = ["-m", "my_server"]
-
-[mcp.my_stdio.env]
-DEBUG = "1"
-
-# The bundled Playwright MCP server (lets Claude drive the preinstalled Chromium).
-# Omitting --browser uses Playwright's bundled Chromium (the one preinstalled);
-# --headless because the container has no display, --no-sandbox because it's
-# already sandboxed:
-[mcp.playwright]
-type = "stdio"
-command = "playwright-mcp"
-args = ["--headless", "--no-sandbox"]
-```
-
-A single `[mcp.NAME]` table drives **all three** bundled agents. For Claude Code, `maudebox` serializes the tables to `$XDG_STATE_HOME/maudebox/managed-mcp.json` and bind-mounts them read-only at `/etc/claude-code/managed-mcp.json` (**managed scope** — every session loads them, they show up in `claude mcp list`, no `claude mcp add` needed). The field set is passed through verbatim (validation is Claude's job); see Claude Code's MCP docs for the fields (`type`, `url`, `command`, `args`, `env`, `headers`, …).
-
-For Codex, the same tables are translated into `[mcp_servers.NAME]` entries in `/etc/codex/config.toml` (Codex's lowest-precedence **system** config layer). Codex spells MCP config differently — no `type` field (transport is inferred from `command` vs `url`), `headers` is `http_headers`, and unknown fields are rejected — so the translation maps the fields the two agents share (`command`, `args`, `env`, `url`, `cwd`, and `headers` → `http_headers`) and drops `type`. Anything else prints a warning and is dropped. For Codex-only keys (e.g. `bearer_token_env_var`, `startup_timeout_sec`), add a per-server `[mcp.NAME.codex]` sub-table — its keys are passed through to Codex verbatim and override the translated ones, and it's stripped from Claude's config:
-
-```toml
-[mcp.github]
-type = "http"                       # used by Claude, dropped for Codex
-url  = "https://api.example.com/mcp"
-headers = { X-Env = "prod" }        # -> http_headers for Codex
-
-[mcp.github.codex]                   # Codex-only extras/overrides
-bearer_token_env_var = "GITHUB_TOKEN"
-```
-
-For opencode, the same tables become the `mcp` object of `/etc/opencode/opencode.json` — opencode's **managed** config layer, which (like Claude's managed scope, and unlike Codex's system layer) outranks every user-writable config. opencode splits servers by transport into `"type": "local"` and `"type": "remote"`, so the translation picks one based on whether `url` is present and then maps only the fields that transport accepts: for a local server the program and its arguments are folded into a single `command` array and `env` becomes `environment`; for a remote server `url` and `headers` carry over. Claude's `type` hint is dropped in favour of opencode's own. Anything that doesn't apply prints a warning and is dropped; opencode-only keys (`enabled`, `timeout`, `oauth`, …) go in a per-server `[mcp.NAME.opencode]` sub-table, passed through verbatim and overriding the translated fields:
-
-```toml
-[mcp.playwright.opencode]            # opencode-only extras/overrides
-timeout = 30000
-```
-
-Each agent's sub-table is stripped from the other two agents' configs, so `[mcp.NAME.codex]` and `[mcp.NAME.opencode]` can coexist under one server.
-
-To reach a server running on the host, use `host.docker.internal` as shown above (see *Reaching host services*). Remove or comment out the table to drop the server — the Claude and opencode files aren't written when no `[mcp.*]` tables are present (the Codex system config is always written, since it also carries the sandbox default below), and managed scope is read-only inside the container (users can't disable an entry via `claude mcp remove`).
-
-Verify inside the container with `claude mcp list` — managed entries are loaded automatically:
-
-```
-$ claude mcp list
-my_http: http://host.docker.internal:8080/mcp (HTTP) - ✓ Connected
-my_stdio: python -m my_server (stdio) - ✓ Connected
-```
-
-Edits to the user config only take effect for **new** containers; an already-running container keeps using the snapshot of the file it was launched with. Exit and relaunch `maudebox` to pick up changes.
-
-### Codex
-
-`codex` runs inside the same isolated container as `claude`. Because the container already *is* the sandbox (see *Sandboxed execution* above), `maudebox` writes `sandbox_mode = "danger-full-access"` and `approval_policy = "never"` into the low-precedence `/etc/codex/config.toml` so Codex doesn't layer its own Landlock sandbox and approval prompts on top — the same reasoning behind `IS_SANDBOX=1` for Claude. This is the lowest config layer, so your own `~/.codex/config.toml` (persisted in the selected state namespace) can tighten it back up if you prefer. Log in once with `codex login` per namespace; the login persists across launches using it. Global instructions go in `~/.codex/AGENTS.md` on the host (bind-mounted read-only); per-project instructions in an `AGENTS.md` at the project root.
-
-**Host-side Codex settings.** Anything else you want Codex to pick up in every container goes in a `[codex]` table in the user config:
-
-```toml
-[codex]
-model_provider = "litellm"
-model = "my-model"
-model_reasoning_effort = "high"
-
-[codex.model_providers.litellm]
-name = "LiteLLM"
-base_url = "http://host.docker.internal:4000/v1"   # see *Reaching host services*
-wire_api = "responses"                             # Codex 0.149+ rejects "chat"
-http_headers = { Authorization = "Bearer sk-..." }
-```
-
-The point is durability: the container's own `~/.codex/config.toml` lives in the selected state namespace, so settings put there are lost if that namespace is removed, and there is no route to seed it from the host. The `[codex]` table is written on the host and bind-mounted, so it survives any container or volume being dropped.
-
-It lands at `/etc/codex/managed_config.toml` rather than in the system config above, because Codex silently ignores `model_provider` and `model_providers` in the system layer (it ignores them in the project layer too, there with a warning). **That layer outranks both `~/.codex/config.toml` and `-c`**, so a key you put here is pinned — you can't switch it back for a single invocation, only by editing the table and relaunching. Keep settings you want to vary per session out of it; maudebox's own defaults deliberately stay in the overridable system config. MCP servers don't belong here either — declare those as `[mcp.NAME]` tables so all three agents get them; `codex.mcp_servers` is rejected.
-
-**Remote control.** Codex is installed as the official installer's "standalone" layout (not a bare binary) specifically so `codex remote-control start` works — that daemon requires the standalone install, and it's what lets the ChatGPT app (mobile, web, desktop) drive a session running in the container. It's an outbound websocket to OpenAI's cloud (authenticated by your `codex login`), so nothing needs publishing. Pair once with `codex remote-control pair`; the enrollment persists in the selected state namespace, so afterwards `codex remote-control start` alone re-enrolls. The container hostname is set to `$MAUDEBOX_INSTANCE`, so a paired worktree shows up under its handle (e.g. `trino-review`) in your device list rather than a random container ID. To also attach a local terminal to the same session, run `codex --remote unix://` in another pane. (Unlike Claude's single `--remote-control` flag, Codex splits this into a daemon plus attached frontends.)
-
-### opencode
-
-`opencode` runs inside the same container as `claude` and `codex`, and is bundled as a pinned native binary. Log in once with `opencode auth login` (or `/connect` inside the TUI) and the login persists across launches in that namespace — but only inside Maudebox. **opencode's credentials in the container are deliberately separate from the host's**: nothing under its data directory is bind-mounted, so a namespace can hold different (or more limited) provider credentials than the host user does. Removing the namespace costs one re-login.
-
-**No confirmation prompts.** The container already *is* the sandbox, so the entrypoint seeds `{"permission": "allow"}` into the container's global `~/.config/opencode/opencode.json` on first launch — the same reasoning as `IS_SANDBOX=1` for Claude and `sandbox_mode = "danger-full-access"` for Codex. Most of opencode's permissions already default to `allow`; the one that matters here is `external_directory`, which otherwise prompts constantly, since a jj workspace's base repo legitimately lives outside the project directory. The seed goes into the *global* layer rather than the managed one precisely so you can still change it: edit that file (it persists in the state volume), or override it per project in the project's `opencode.json`. A managed-layer setting could not be overridden at all. For a one-off session instead, `opencode --auto` auto-approves anything not explicitly denied.
-
-**Global config from the host.** `~/.config/opencode/`'s `AGENTS.md`, `tui.json`, `agent/`, `command/`, `skill/` and `plugin/` are bind-mounted read-only if they exist, so hand-authored agents, commands and skills survive the state volume being dropped. `opencode.json` is **not** mounted — it's where `provider.<id>.options.apiKey` lives, and mounting it would pull host credentials into the container. Add a `mounts` entry for it if you want it anyway. Instructions and skills mostly need nothing: opencode falls back to `~/.claude/CLAUDE.md` when there's no `~/.config/opencode/AGENTS.md`, and auto-loads skills from both `~/.claude/skills/` and `~/.agents/skills/` — all already mounted for the other two agents.
-
-**Remote access.** `opencode serve --hostname 0.0.0.0 --port 4096` starts a headless server in the container; `opencode attach http://<host>:4096` connects a TUI from elsewhere, and `opencode web` serves a browser UI. Add `--username`/`--password` (or `OPENCODE_SERVER_USERNAME`/`OPENCODE_SERVER_PASSWORD`) for basic auth — do that before binding to `0.0.0.0`. `maudebox` publishes no ports, so how you reach it depends on the host:
-
-- **From the same host**, connect to the container's IP directly — on Linux the bridge network is routable, and OrbStack additionally resolves `<instance>.orb.local`. `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' <instance>` prints it. Docker Desktop for Mac does not route container IPs.
-- **From another container**, put both on the same Docker network with the `network` config key (see *Reaching host services*) and use the instance name.
-- **From another machine**, there's currently no supported path — that would need a published port, which the wrapper has no flag for.
-
-For a second terminal on the same machine, `docker exec -it <instance> opencode` is usually simpler than a server: the container is named after `$MAUDEBOX_INSTANCE`.
-
-**Window titles.** The terminal is named after the instance: the entrypoint emits it, `prompt.sh` re-asserts it at every prompt, and under tmux the wrapper renames the window host-side with `tmux rename-window "$MAUDEBOX_INSTANCE"` (which also turns `automatic-rename` off, so nothing in the container can change it). Claude Code and Codex emit no title escape, so the instance name simply stands. opencode is the exception — it sets `OSC 0` to the constant `OpenCode`, and under iTerm2's tmux control mode (`tmux -CC`) the emulator parses the pane stream directly, so that would replace your instance name on the tab. The image therefore sets `OPENCODE_DISABLE_TERMINAL_TITLE=1`; unset it for a launch if you want opencode's titles back.
-
-### Spawning a new workspace or worktree
-
-`maudebox new <name>` creates a fresh jj workspace or git worktree off an existing project and launches `maudebox` on it. By default the workspace persists after the container exits, just like running `maudebox <path>` would — `new` is essentially `mkdir-and-enter`. Pass `--ephemeral` for short-lived scratch workspaces that should be torn down on exit.
-
-The source project defaults to the current directory; `--source` points it elsewhere. Anything after `<name>` is the command to run inside the new workspace — with no positional source argument, there's no ambiguity between a source directory and the command.
-
-```sh
-maudebox new feature-x                       # new workspace off the default branch
-maudebox new feature-x --source trino        # ...from another project (path or name)
-maudebox new feature-x --from main           # start from a specific revision
-maudebox new feature-x --fetch               # fetch first, then branch off the default
-maudebox new feature-x --path /tmp/scratch   # custom target path
-maudebox new feature-x --ephemeral           # tear down workspace + volumes on exit
-maudebox new feature-x claude                # spawn the workspace, run a command in it
-```
-
-Defaults:
-
-- **Source project:** the current directory. Override with `--source PATH-OR-NAME` — a path, or a bare name resolved like `maudebox <name>` (see [Referring to projects by name](#referring-to-projects-by-name)).
-- **Target path:** `<project>/../<basename>.<name>` (sibling of the source project). Override with `--path PATH`.
-- **Starting revision:** the project's **default branch** — jj's `trunk()`, or the branch `origin/HEAD` points at for git. `main` vs `master` is detected per repo (from `origin/HEAD`, falling back to probing `origin/main` / `origin/master`), never assumed. Override with `--from REV`; `--from @-` (jj) or `--from HEAD` (git) branches from the source's current checkout instead. For git, a new branch named `<name>` is created at that revision. Add `--fetch` to refresh remote-tracking refs first, so the workspace starts from current upstream rather than the last fetch.
-- **VCS choice:** jj is preferred when both `.jj/` and `.git` are present (colocated repos).
-
-#### Reattaching to a non-ephemeral workspace
-
-After `maudebox new <name>` exits (without `--ephemeral`), the workspace persists at its sibling path. You don't need to remember the path to re-launch it — `maudebox <name>` looks the name up in the manifest store and reattaches:
-
-```sh
-maudebox new feature-x         # creates worktree at <project>/../<basename>.feature-x
-exit
-maudebox feature-x             # re-enters the same workspace
-maudebox feature-x mvnd verify # …or run a one-shot command in it
-```
-
-Name lookup is only attempted when the first positional doesn't look like a path (no leading `/`, `.`, `~` and no embedded `/`). A bare name has to match exactly one workspace whose target directory still exists on disk; ambiguous matches across projects bail out asking for the full path, and a miss falls through to the regular `<path>` handling. Workspaces created by older maudebox versions (before the worktree path was recorded in the manifest) aren't reattachable by name — keep launching them via `maudebox <path>` until they're torn down.
-
-#### Ephemeral mode
-
-With `--ephemeral`, the wrapper tears the workspace down once the container exits — on a clean exit, an error, or Ctrl-C alike. The teardown delegates to `maudebox rm`, which reads the manifest `new` wrote into the per-instance state dir and:
-
-- **jj:** runs `jj workspace forget <name>` and `rm -rf <target>`. The change at `@` in that workspace becomes a regular commit in jj's op log, so committed work is recoverable via `jj op log` / `jj op restore`.
-- **git:** runs `git worktree remove --force <target>` and `git branch -D <name>`. Branch tip commits remain reachable via the reflog (default 90 days).
-- **Project volumes:** any `maudebox-overlay-…` volumes and container runtime volumes are removed.
-- **State dir:** the per-instance state dir under `$XDG_STATE_HOME/maudebox/instances/…` is removed last.
-
-Uncommitted working-copy changes are **not** preserved. Commit before exiting the container if you might want them later.
-
-##### Changing your mind mid-session
-
-If you've launched an ephemeral instance and later decide you'd rather hold onto it, you can disarm the cleanup without leaving the running container:
-
-- **From inside the container:** run `maudebox-keep`.
-- **From the host:** run `maudebox keep <id-or-name>`, where the argument is the container ID (as shown by `maudebox list`), the instance basename, or the original name passed to `maudebox new`.
-
-Either form drops a `keep` flag in the state dir. On exit, the wrapper sees the flag, removes only the flag itself (the manifest stays in place), and leaves the workspace, project volumes, and state dir intact — so a later `maudebox rm <name>` still recognizes the workspace as maudebox-managed and can do the full teardown when you really are done with it.
-
-Keeping an ephemeral workspace does not preserve Maven local installs: those live in the individual container's writable layer and disappear whenever that container exits. Both keep forms are no-ops for non-ephemeral instances. After the container exits, a kept workspace is just a regular jj workspace / git worktree.
-
-## How it works
-
-### Maven repository
-
-Every container uses this repository layout:
-
-| Container path                                  | Source                                      | Lifetime  |
-| ----------------------------------------------- | ------------------------------------------- | --------- |
-| `/root/.m2/repository/remote-cache`              | host `~/.m2/repository` (RW bind mount)     | persistent |
-| `/root/.m2/repository/local-installs`            | container writable layer                    | container |
-
-The image enables Resolver's enhanced split local repository with `remotePrefix=remote-cache` and `localPrefix=local-installs`. Although the remote prefix is nested inside the container, its bind source is the host repository root, so artifacts retain Maven's conventional host paths. Resolver's lock directory is explicitly placed at `remote-cache/.locks`, which maps to the host's conventional `.locks` directory and coordinates host and container writers. Conventional Maven and Maven Wrapper receive the settings through `MAVEN_OPTS`. The image's `mvnd`/`mvn` launcher also prepends them as Maven user properties to every mvnd request, after project configuration has been loaded; project-level `.mvn/mvnd.properties` and `.mvn/jvm.config` therefore cannot silently disable the split layout.
-
-Local installs disappear automatically with `docker run --rm`; there is no Maven volume for `maudebox rm` to maintain. If Maven is launched with the split settings explicitly disabled, it falls back to the container's repository root and may download an ephemeral duplicate, but it does not write into the host bind mounted at `remote-cache/`.
-
-### Overlay mounts (optional)
-
-For each mount spec that uses mode `overlay` (for example `~/.gradle:~/.gradle:overlay`), the container gets an overlayfs at the target path with three layers:
-
-| Layer    | Source                                                  | Mode |
-| -------- | ------------------------------------------------------- | ---- |
-| lower    | the host source path                                    | ro   |
-| upper    | per-worktree+per-target Docker volume (`maudebox-overlay-…-<target-hash>`) | rw   |
-| workdir  | sibling subdir in the same volume                       | rw   |
-
-Effect: tools inside the container see the host files as a read-only starting point, but their writes land in a worktree-scoped volume. Concurrent containers for different worktrees do not collide, and the host source is not mutated. You can declare more than one and each gets its own per-worktree volume. Without an `overlay` mount (or `--fuse`, which needs the same privileges for its own `mount(2)` call), maudebox does not request `SYS_ADMIN` or disable the AppArmor profile. Every container still receives the much narrower `PERFMON` capability so the bundled `perf` can use `perf_event_open(2)`.
-
-`maudebox list` shows one row per **project** — the worktree plus whatever maudebox keeps for it on disk — and surfaces a project that is currently running, still owns a volume, or was created by `maudebox new` (a persisted manifest). Instances are not rows: an instance is a running container and ceases to exist when that container exits, so the `INSTANCES` column lists the ones running against that project right now (`-` when none), annotated with their state namespace such as `trino [default], trino-review [work]`. Those handles are also the container names, so they are what `docker exec` and `maudebox keep` take. `maudebox rm <project>` removes every volume labelled with that project, drops its state dir, and — if the state dir holds a manifest left by `maudebox new` — also tears down the jj workspace / git worktree. A path handed to `maudebox <path>` directly has no manifest, so `rm` leaves the worktree alone and only cleans up what maudebox itself created.\n\nEverything it removes is **project-scoped**, shared by every instance of that project, so `rm` is refused while any container is running against it — stop them first. The argument is a project path or basename; a running container's ID or instance handle also works and resolves to that container's project. State namespaces have their own lifecycle and are never removed by project cleanup.
-
-The per-worktree volume name is derived from the basename of the project directory plus a SHA-256 prefix of its full path:
-
-```
-maudebox-overlay-<basename>-<8-char-hash>
-```
-
-### Login state and global config
-
-Each state namespace is a Docker volume holding writable state across launches that select it, with isolated subtrees mounted at the canonical paths each tool expects:
-
-- `claude/` → `/root/.claude` (Claude login, plugin caches)
-- `codex/` → `/root/.codex` (Codex login, `config.toml`, sessions, state DB — `$CODEX_HOME`)
-- `gh/` → `/root/.config/gh` (`gh auth` token, config)
-- `ssh/` → `/root/.ssh` (SSH keys, `known_hosts`)
-- `opencode/config` → `/root/.config/opencode` (opencode config, agents, commands, skills)
-- `opencode/data` → `/root/.local/share/opencode` (opencode login, session database, logs)
-- `opencode/state` → `/root/.local/state/opencode` (locks guarding that database)
-- `opencode/cache` → `/root/.cache/opencode` (LSP servers opencode downloads on demand)
-
-The `codex/` subtree is `$CODEX_HOME`, where Codex keeps everything including its SQLite state DB. That DB opens in WAL mode with a busy timeout, and the named volume is VM-local (not virtiofs), so concurrent containers share it as safely as concurrent Codex sessions on one host. Unlike Claude, Codex keeps its login token inside `$CODEX_HOME`, so no symlink is needed — the subtree persists the login directly.
-
-opencode needs four subtrees rather than one because it follows the XDG split instead of keeping everything in a single home directory (`opencode debug paths` lists them). Its session database is SQLite in WAL mode, so it carries the same caveat as Codex's — safe to share across concurrent containers precisely because a named volume is VM-local, and the reason it is never bind-mounted from the host. Like `ssh/`, opencode's `data/` is **container-only**: its logins are separate from the host's, so a container can use different or more limited credentials.
-
-The `ssh/` subtree is a **container-only** `~/.ssh`, distinct from the host's (which is never mounted). It starts empty; generate a key inside a namespace with `ssh-keygen` — or add one however you like — and future launches using that namespace reuse it. The entrypoint resets the directory to mode `0700` on each launch so OpenSSH accepts it.
-
-On top of the `claude/` subtree, the following items from the host's `~/.claude/` are bind-mounted read-only (only those that actually exist on the host):
-
-- `CLAUDE.md` — your global instructions
-- `settings.json`
-- `agents/`
-- `commands/`
-- `plugins/`
-
-Items that are keyed to host paths or are session-only state (`projects/`, `todos/`, `statsig/`, `shell-snapshots/`) are intentionally **not** mounted.
-
-opencode's hand-authored global config is bind-mounted read-only from the host too (only what exists): `~/.config/opencode/`'s `AGENTS.md`, `tui.json`, `agent/`, `command/`, `skill/` and `plugin/` — so it outlives the state volume. Its `opencode.json` is deliberately excluded, since that is where provider API keys live; see [opencode](#opencode).
-
-Codex's equivalents are bind-mounted read-only too (only if they exist on the host): `~/.codex/AGENTS.md` (your global instructions — Codex's `CLAUDE.md`-equivalent, and also its memory, since Codex has no separate memory store) and `~/.agents/skills/`. Per-project instructions live in an `AGENTS.md` at the project root, which is already inside the bind-mounted worktree, so nothing extra is needed for those.
-
-`~/.claude.json` (Claude's login token and project state) lives outside `~/.claude/`, so the entrypoint symlinks it into the persistent volume:
-
-```
-~/.claude.json -> ~/.claude/state.json
-```
-
-This means: **log in to Claude Code, Codex, opencode and `gh` once inside a namespace**, and future launches using that namespace will already be logged in.
-
-Select a namespace per launch with `--state`; the selector also applies to
-`maudebox new`:
-
-```sh
-maudebox --state work .
-maudebox --state personal new feature-x
-```
-
-`state = "work"` in the user config supplies the default when the flag is
-absent. Without either, the reserved `default` namespace uses the original
-`maudebox-state` volume unchanged. Named namespaces use labeled volumes such as
-`maudebox-state-work`. Names are 1–32 lowercase letters, digits, or single
-hyphens and must start and end with a letter or digit.
-
-Use `maudebox state list` to see namespaces and the running instances using
-them. `maudebox state rm work` removes one after all containers using it have
-stopped; this forgets every credential, session, and tool state in that
-namespace. `maudebox rm <project>` and ephemeral cleanup never remove state
-namespaces.
-
-### Terminal integration
-
-The container's tty is the terminal you launched from, so the wrapper forwards enough of the host environment for programs inside to talk to it correctly: `TERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `COLORTERM`, and iTerm2's `LC_TERMINAL*` pair. `TERM_PROGRAM` is forced to `tmux` when the host is inside a tmux session, since tmux only exports it itself from 3.2 on — TUIs read it to decide whether to wrap escape sequences (notably clipboard writes) in tmux's DCS passthrough, and guessing wrong means the sequence lands somewhere that never unwraps it.
-
-`TERM` matters for capabilities rather than dialect. Left unset, `docker run -it` defaults it to a bare `xterm`, so everything that consults terminfo inside the container — ncurses programs, pagers, editors — reasons about a terminal from 1984 rather than yours. The image carries the extended terminfo database (`ncurses-term`) so forwarded values usually resolve, and the entrypoint falls back to `xterm-256color` with a notice when one doesn't — an unrecognized `TERM` makes ncurses programs fail rather than degrade. Enhanced key reporting is *not* part of this: TUIs negotiate that at runtime by probing the terminal, independently of `TERM`.
-
-**Known issue — iTerm2 tmux control mode.** Under iTerm2's tmux integration (`tmux -CC`), ctrl-chords can arrive in a TUI as the literal text `0x10` / `0x3` instead of firing. It is an iTerm2 bug ([fix](https://github.com/gnachman/iTerm2/commit/dc0587cb3a68128f15799407a8cb8391ad7ab70e), shipped in the 3.7.0 betas): when the tmux server has extended keys enabled and the application requests `modifyOtherKeys` mode 1, tmux's `send-keys` falls through to its literal-text path and writes the argument string into the pane. opencode trips it because mode 1 is what it asks for; Claude Code and vim use mode 2 and codex disables `modifyOtherKeys` outright, so they are unaffected. Workarounds: `set -s extended-keys off` in tmux, attach with a plain `tmux attach` instead of `-CC`, or run iTerm2 3.7.0beta6 or newer.
-
-Two related things a container can't do for itself: setting the tmux window name (the wrapper does it host-side, see [Spawning a new workspace or worktree](#spawning-a-new-workspace-or-worktree)) and writing the system clipboard. The latter has no path out of the container except OSC 52, which needs `set -g set-clipboard on` and `set -g allow-passthrough on` in tmux, plus your terminal's permission to let applications set the clipboard.
-
-### Container user
-
-The container runs as **root** (UID 0) on macOS. This is intentional: OrbStack and similar virtiofs setups root-squash the host bind-mounts, so files in the lower layer of an overlay mount appear as `uid=0` inside the container. Overlayfs preserves that UID on copy-up, which means a non-root container user couldn't write to anything pre-existing in the host source. Running as root sidesteps the whole class of "permission denied on file inherited from the host" failures (mvnd registry, Aether lock files, install-plugin tmp files, etc.). On Linux the entrypoint drops privileges to the host UID after the privileged setup steps are done.
-
-Everything lives under `/root`: the Claude config (`/root/.claude`), the Maven mounts under `/root/.m2/repository`, any opt-in overlay targets, and a `/root/<basename>` symlink to your worktree's host path. Files written to bind-mounted paths land back on the host owned by your host user, courtesy of virtiofs UID translation (macOS) or the privilege drop (Linux).
-
-Because of the Linux privilege drop, in-container privileged operations (`apt-get install`, `mount`, etc.) fail with `Permission denied`. The image installs `sudo` and grants the runtime user passwordless sudo, so the escape hatch is `sudo apt-get install …` (or `sudo -i` for a root shell). The rule is inert on macOS/OrbStack where the session stays root anyway.
-
-## Cleanup
-
-```sh
-maudebox rm /path/to/project        # tear down an instance (workspace if maudebox created it, plus volumes + state dir)
-maudebox state rm default           # forget the default namespace's credentials and sessions
-docker rmi maudebox                 # remove the image
-```
-
-## Layout
-
-- `Cargo.toml`, `src/` — the host-side `maudebox` wrapper (single binary, no runtime deps).
-- `xtask/` — small Rust helper crate wired in as `cargo xtask`. Drives `docker build` (and, for `all`, also `cargo build --release`).
-- `.cargo/config.toml` — defines the `xtask` alias so `cargo xtask <subcommand>` works.
-- `rust-toolchain.toml` — pins the development toolchain and installs `rustfmt` and Clippy.
-- `.github/workflows/ci.yml` — formatting, Clippy, tests, ShellCheck, and Docker image build checks.
-- `docker/` — everything the image is built from:
-    - `Dockerfile` — image definition.
-    - `entrypoint.sh` — overlayfs setup, UID drop on Linux, Claude state symlink, then `exec` the user command.
-    - `prompt.sh` — bash prompt with jj/git VCS info, sourced from `/etc/bash.bashrc`.
-    - `aliases.sh` — installs entries from `MAUDEBOX_ALIASES` as interactive shell aliases.
-    - `maudebox-keep` — in-container script for disarming ephemeral cleanup.
+`maudebox --help` lists every option; `cargo xtask image --help` lists the version pins.
+
+## Documentation
+
+| Guide | Covers |
+| --- | --- |
+| [Usage](docs/guides/usage.md) | Launching, instance names, project names, `maudebox new`, ephemeral workspaces, cleanup |
+| [Configuration](docs/guides/configuration.md) | `config.toml`, mounts, aliases, default command, networking, FUSE |
+| [Agents and state](docs/guides/agents.md) | State namespaces, logins, global config, managed MCP servers, Codex, opencode, terminal integration |
+| [Internals](docs/guides/internals.md) | Maven repository, overlays, container user model, repository layout, building the image |
+| [Product specification](docs/SPEC.md) | Source of truth for user-visible behavior and deliberate limits |
+| [Decision records](docs/decisions/) | Why the non-obvious choices were made |
+
+Contributors: start with [`CLAUDE.md`](CLAUDE.md).
